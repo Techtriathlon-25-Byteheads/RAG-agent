@@ -3,15 +3,13 @@ from langchain_openai import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain_core.messages import AIMessage, HumanMessage
 from loader import load_and_create_vectorstore
-import os
-import json
-import re
+import os, json, re
 from dotenv import load_dotenv
+import langdetect
 
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 
-# Validate API Key
 if not api_key:
     raise ValueError("OPENAI_API_KEY not found in environment variables.")
 
@@ -33,8 +31,12 @@ welcome_message = "Hello! This is Nawariyan AI assistant. How can I help you tod
 sessions = {}
 
 
-def load_prompt_template(path="prompt.md"):
-    """Loads the prompt template from a file."""
+def load_prompt_template(lang="en"):
+    path_map = {
+        "en": "prompts/prompt_en.md",
+        "si": "prompts/prompt_si.md",
+    }
+    path = path_map.get(lang, path_map["en"])
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
@@ -44,18 +46,11 @@ def load_prompt_template(path="prompt.md"):
 
 
 def extract_action_details(text: str):
-    """
-    Extracts a JSON block describing an action from the AI response text.
-    
-    Returns:
-        tuple: (clean_answer, action_dict or None)
-    """
     try:
         json_match = re.search(r"(\{.*?\})", text, re.DOTALL)
         if json_match:
             json_str = json_match.group(1)
             action_json = json.loads(json_str)
-            
             clean_answer = text.replace(json_str, "").strip()
             return clean_answer, action_json
     except json.JSONDecodeError:
@@ -65,11 +60,10 @@ def extract_action_details(text: str):
 
     return text.strip(), None
 
+
 def format_history(history_messages):
-    """Formats the conversation history for the prompt."""
     if not history_messages:
         return "No conversation history yet."
-    
     formatted = []
     for msg in history_messages:
         if isinstance(msg, HumanMessage):
@@ -82,15 +76,16 @@ def format_history(history_messages):
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
-    
-    # Initialize session if it's new
+
     if session_id not in sessions:
         print(f"New session created: {session_id}")
-        sessions[session_id] = ConversationBufferMemory(memory_key="history", return_messages=True)
+        sessions[session_id] = {
+            "memory": ConversationBufferMemory(memory_key="history", return_messages=True),
+            "lang": "en"
+        }
 
-    memory = sessions[session_id]
+    memory = sessions[session_id]["memory"]
 
-    # Send welcome message only if history is empty
     if not memory.chat_memory.messages:
         memory.chat_memory.add_ai_message(welcome_message)
         await websocket.send_text(welcome_message)
@@ -100,40 +95,38 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             data = await websocket.receive_text()
             memory.chat_memory.add_user_message(data)
 
-            # 1. Retrieve context from the vector store (RAG step)
             results = chroma_db.similarity_search(data, k=3)
             context = "\n\n---\n\n".join([doc.page_content for doc in results])
 
-            # 2. Prepare the prompt
-            prompt_template = load_prompt_template()
-            
-            # Load and format history correctly
-            history_messages = memory.load_memory_variables({})['history']
-            formatted_history = format_history(history_messages[:-1]) # Exclude the latest user message
+            lang = langdetect.detect(data)
+            if lang not in ["en", "si"]:
+                lang = "en"
 
-            # CORRECTED: Pass all required variables ('history', 'context', 'input') to the prompt
+            prompt_template = load_prompt_template(lang)
+
+            history_messages = memory.load_memory_variables({})["history"]
+            formatted_history = format_history(history_messages[:-1])
+
             prompt = prompt_template.format(
-                history=formatted_history, 
-                context=context, 
+                history=formatted_history,
+                context=context,
                 input=data
             )
 
-            # 3. Get response from LLM
-            # Using .invoke() which is the recommended method over the legacy .predict()
             full_response = (await llm.ainvoke(prompt)).content
-            
+
             clean_answer, action_details = extract_action_details(full_response)
 
-            # 4. Save only the clean, user-facing answer to memory
+
             memory.chat_memory.add_ai_message(clean_answer)
 
-            # 5. Send the structured response to the client
             response_payload = {
                 "answer": clean_answer,
                 "action_details": action_details,
-                "history": [m.content for m in memory.chat_memory.messages] # For client-side display
+                "history": [m.content for m in memory.chat_memory.messages] 
             }
             await websocket.send_json(response_payload)
+            
 
     except WebSocketDisconnect:
         print(f"Client disconnected: {session_id}")
