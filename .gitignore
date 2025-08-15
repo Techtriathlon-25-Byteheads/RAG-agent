@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+#Vector Database
+data/
+
 # C extensions
 *.so
 
